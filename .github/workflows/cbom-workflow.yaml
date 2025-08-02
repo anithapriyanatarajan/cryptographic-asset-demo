@@ -1,0 +1,232 @@
+name: CBOM Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      scan_url:
+        description: 'Repository URL to scan (defaults to current repo)'
+        required: false
+        type: string
+      branch:
+        description: 'Branch to scan (defaults to current branch)'
+        required: false
+        type: string
+      subfolder:
+        description: 'Subfolder to scan (optional)'
+        required: false
+        type: string
+
+env:
+  CBOMKIT_API_URL: ${{ inputs.scan_url || 'https://1b0849357ee9.ngrok-free.app' }}
+
+jobs:
+  cbom-scan:
+    runs-on: ubuntu-latest
+    name: Generate CBOM
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up variables
+      id: vars
+      env:
+        INPUT_SCAN_URL: ${{ github.event.inputs.scan_url }}
+        INPUT_BRANCH: main
+        INPUT_SUBFOLDER: ${{ github.event.inputs.subfolder }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REF_NAME: main
+      run: |
+        # Set scan URL (use input or current repo)
+        if [ -n "$INPUT_SCAN_URL" ]; then
+          echo "scan_url=$INPUT_SCAN_URL" >> $GITHUB_OUTPUT
+        else
+          echo "scan_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" >> $GITHUB_OUTPUT
+        fi
+        
+        # Set branch (use input or current branch)
+        if [ -n "$INPUT_BRANCH" ]; then
+          echo "branch=$INPUT_BRANCH" >> $GITHUB_OUTPUT
+        else
+          echo "branch=$GITHUB_REF_NAME" >> $GITHUB_OUTPUT
+        fi
+        
+        # Set subfolder if provided
+        if [ -n "$INPUT_SUBFOLDER" ]; then
+          echo "subfolder=$INPUT_SUBFOLDER" >> $GITHUB_OUTPUT
+        else
+          echo "subfolder=" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Prepare scan request
+      id: scan-request
+      env:
+        SCAN_URL: ${{ steps.vars.outputs.scan_url }}
+        BRANCH: ${{ steps.vars.outputs.branch }}
+        SUBFOLDER: ${{ steps.vars.outputs.subfolder }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Create scan request JSON
+        scan_request=$(cat <<EOF
+        {
+          "scanUrl": "$SCAN_URL",
+          "branch": "$BRANCH"
+        }
+        EOF
+        )
+        
+        # Add subfolder if specified
+        if [ -n "$SUBFOLDER" ]; then
+          scan_request=$(echo "$scan_request" | jq --arg subfolder "$SUBFOLDER" '. + {subfolder: $subfolder}')
+        fi
+        
+        # Add GitHub token for authentication if scanning current repo
+        if [[ "$SCAN_URL" == "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" ]]; then
+          scan_request=$(echo "$scan_request" | jq --arg token "$GITHUB_TOKEN" '. + {credentials: {pat: $token}}')
+        fi
+        
+        # Properly encode JSON for GitHub Actions output (compact format)
+        scan_request_compact=$(echo "$scan_request" | jq -c '.')
+        echo "request=$scan_request_compact" >> $GITHUB_OUTPUT
+        echo "Scan request prepared:"
+        echo "$scan_request" | jq '.'
+    
+    - name: Trigger CBOM scan
+      id: scan
+      env:
+        SCAN_REQUEST: ${{ steps.scan-request.outputs.request }}
+      run: |
+        echo "Initiating CBOM scan..."
+        echo "API URL: $CBOMKIT_API_URL/api/v1/scan"
+        echo "Request: $SCAN_REQUEST"
+        echo "Full curl command:"
+        echo "curl -X POST -H \"Content-Type: application/json\" -d '$SCAN_REQUEST' '$CBOMKIT_API_URL/api/v1/scan'"
+        
+        response=$(curl -s -w "HTTPSTATUS:%{http_code}" \
+          -X POST \
+          -H "Content-Type: application/json" \
+          -d "$SCAN_REQUEST" \
+          "$CBOMKIT_API_URL/api/v1/scan")
+        
+        http_code=$(echo "$response" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+        body=$(echo "$response" | sed -e 's/HTTPSTATUS:.*//g')
+        
+        echo "HTTP Status: $http_code"
+        echo "Response: $body"
+        
+        if [ "$http_code" -eq 202 ]; then
+          echo "✅ CBOM scan initiated successfully"
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "❌ CBOM scan failed with status $http_code"
+          echo "status=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+    
+    - name: Wait and retrieve CBOM
+      if: steps.scan.outputs.status == 'success'
+      id: retrieve
+      env:
+        SCAN_URL: ${{ steps.vars.outputs.scan_url }}
+      run: |
+        echo "Waiting for scan to complete..."
+        sleep 30  # Wait for scan to process
+        
+        # Extract repository owner and name from scan URL
+        repo_path=$(echo "$SCAN_URL" | sed 's|https://github.com/||' | sed 's|http://github.com/||')
+        
+        # Fetch latest refs and get commit hash from main branch
+        git fetch origin main
+        commit_hash=$(git rev-parse origin/main | cut -c1-7)
+        
+        # Create project identifier in package URL format
+        project_id="pkg:github/${repo_path}@${commit_hash}"
+        project_id_encoded=$(echo "$project_id" | jq -rR @uri)
+        
+        echo "Project ID: $project_id"
+        echo "Encoded Project ID: $project_id_encoded"
+        
+        # Try to retrieve the CBOM
+        max_attempts=12  # 6 minutes total (12 * 30s)
+        attempt=1
+        
+        while [ $attempt -le $max_attempts ]; do
+          echo "Attempt $attempt/$max_attempts to retrieve CBOM..."
+          
+          response=$(curl -s -w "HTTPSTATUS:%{http_code}" \
+            -H "Accept: application/json" \
+            "$CBOMKIT_API_URL/api/v1/cbom/$project_id_encoded")
+          
+          http_code=$(echo "$response" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+          body=$(echo "$response" | sed -e 's/HTTPSTATUS:.*//g')
+          
+          if [ "$http_code" -eq 200 ] && [ -n "$body" ] && [ "$body" != "null" ]; then
+            echo "✅ CBOM retrieved successfully"
+            echo "$body" > cbom.json
+            echo "cbom_available=true" >> $GITHUB_OUTPUT
+            break
+          else
+            echo "⏳ CBOM not ready yet (HTTP $http_code), waiting..."
+            sleep 30
+            ((attempt++))
+          fi
+        done
+        
+        if [ $attempt -gt $max_attempts ]; then
+          echo "⚠️ CBOM retrieval timed out after $max_attempts attempts"
+          echo "cbom_available=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Upload CBOM artifact
+      if: steps.retrieve.outputs.cbom_available == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: cbom-${{ github.run_number }}
+        path: cbom.json
+        retention-days: 5
+    
+    # Upload and Check Compliance
+    - name: Upload and Check Compliance
+      if: steps.retrieve.outputs.cbom_available == 'true'
+      run: |
+        # Check compliance
+        echo "Checking compliance..."
+        curl -X POST \
+          "$CBOMKIT_API_URL/api/v1/compliance/check?policyIdentifier=quantum_safe" \
+          -H "Content-Type: application/json" \
+          -d @cbom.json > output.json
+    
+    # Validate output.json is valid JSON
+    - name: Validate Compliance Output JSON
+      run: |
+        cat output.json
+        echo "Validating output.json..."
+        if ! jq empty output.json 2>jq_error.log; then
+          echo "::error::❌ output.json is not valid JSON."
+          echo "## Compliance Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "❌ **Error** – output.json is not valid JSON. See jq_error.log for details." >> $GITHUB_STEP_SUMMARY
+          echo "--- jq error log ---"
+          cat jq_error.log
+          exit 1
+        fi
+
+    # Parse JSON and check for "Not Quantum Safe" label
+    - name: Check Compliance Status
+      run: |
+        if jq -e '.globalComplianceStatus == false' output.json > /dev/null; then
+          echo "::error::❌ Not compliant – This CBOM does not comply with the policy \"quantum_safe\"."
+          echo "## Compliance Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "❌ **Not compliant** – This CBOM does not comply with the policy \"quantum_safe\"." >> $GITHUB_STEP_SUMMARY
+          exit 1
+        else
+          echo "::notice::✅ Compliant – This CBOM complies with the policy \"quantum_safe\"."
+          echo "## Compliance Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Compliant** – This CBOM complies with the policy \"quantum_safe\"." >> $GITHUB_STEP_SUMMARY
+        fi
