@@ -1,5 +1,5 @@
 # Cryptographic Asset Demo
-
+# DEMO-EDIT
 A simple Java application demonstrating the practical use of cryptographic protocols, algorithms, and certificates in securing data at rest, in use, and in transit.
 
 ## Overview
